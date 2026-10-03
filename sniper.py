@@ -88,7 +88,8 @@ IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://ga
 MAX_WATCH = _i("MAX_WATCH", "25")
 FEE_PCT = _f("EST_ROUND_TRIP_FEE_PCT", "3") / 100
 
-WS_URL = "wss://pumpportal.fun/api/data"
+PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY", "").strip()
+WS_URL = "wss://pumpportal.fun/api/data" + (f"?api-key={PUMPPORTAL_API_KEY}" if PUMPPORTAL_API_KEY else "")
 TRADE_URL = "https://pumpportal.fun/api/trade-local"
 SUPPLY = 1_000_000_000
 TRADES_CSV = Path("trades.csv")
@@ -143,6 +144,8 @@ class Sniper:
         self.pending = 0
         self.stats = {"new": 0, "trades": 0, "buys": 0}
         self.last_beat = time.time()
+        self.other_logged = 0
+        self.trade_logged = False
         self.ws = None
         self.http = None
         self.day, self.day_pnl, self.halt_logged = date.today(), 0.0, False
@@ -217,7 +220,14 @@ class Sniper:
                     await self.on_create(msg)
                 elif t in ("buy", "sell"):
                     self.stats["trades"] += 1
+                    if not self.trade_logged:
+                        log.info("Trade feed working, first trade: %s", str(msg)[:200])
+                        self.trade_logged = True
                     await self.on_trade(msg)
+                elif self.other_logged < 15:
+                    # Subscription replies and errors from PumpPortal, kept for troubleshooting
+                    log.info("PumpPortal says: %s", str(msg)[:300])
+                    self.other_logged += 1
 
     async def sub(self, mint, on=True):
         if not self.ws:
