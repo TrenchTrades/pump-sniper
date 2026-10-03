@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import os
+import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -41,20 +42,20 @@ PROFILES = {
     "medium": SimpleNamespace(
         buy_sol=_f("MEDIUM_BUY_SOL", "0.05"),
         daily_loss=_f("MEDIUM_DAILY_LOSS_SOL", "0.3"),
-        slippage=25, priority_fee=0.0005,
+        slippage=25, priority_fee=0.0005, window=_f("MEDIUM_WINDOW_SEC", "8"),
         tp1=0.40, tp1_sell=0.50,        # at +40%, sell half
         trail=0.20,                     # then trail the rest 20% below its peak
         stop_loss=0.20, max_hold=150, max_positions=3,
-        max_dev_pct=8, window=8, min_buyers=6, min_growth=0.10, require_socials=True,
+        max_dev_pct=8, min_buyers=6, min_growth=0.10, require_socials=True,
     ),
     "high": SimpleNamespace(
         buy_sol=_f("HIGH_BUY_SOL", "0.10"),
         daily_loss=_f("HIGH_DAILY_LOSS_SOL", "0.75"),
-        slippage=35, priority_fee=0.001,
+        slippage=35, priority_fee=0.001, window=_f("HIGH_WINDOW_SEC", "4"),
         tp1=1.00, tp1_sell=0.30,        # at +100%, sell 30%
         trail=0.30,                     # let the rest run with a 30% trailing stop
         stop_loss=0.35, max_hold=300, max_positions=5,
-        max_dev_pct=15, window=4, min_buyers=3, min_growth=0.05, require_socials=False,
+        max_dev_pct=15, min_buyers=3, min_growth=0.05, require_socials=False,
     ),
 }
 
@@ -69,6 +70,18 @@ SCALE_MIN_TRADES = _i("SCALE_MIN_TRADES", "20")      # need this many before any
 SCALE_UP_WINRATE = _f("SCALE_UP_WINRATE_PCT", "50") / 100
 SCALE_DOWN_WINRATE = _f("SCALE_DOWN_WINRATE_PCT", "40") / 100
 SCALE_DOWN_DRAWDOWN = _f("SCALE_DOWN_DRAWDOWN_SOL", "0.3")  # drop to medium if high loses this much
+
+# ---------- speed ----------
+JITO = _b("JITO", "true")                      # also send every trade as a Jito bundle
+JITO_URL = os.getenv("JITO_URL", "https://ny.mainnet.block-engine.jito.wtf").rstrip("/")
+JITO_TIP = _f("JITO_TIP_SOL", "0.0003")       # tip on buys; sells use tip x SELL_URGENCY
+SELL_URGENCY = _f("SELL_URGENCY", "2")        # multiplies priority fee and tip on sells
+JITO_TIP_FALLBACK = [
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY", "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh", "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+]
 
 MAX_WATCH = _i("MAX_WATCH", "25")
 FEE_PCT = _f("EST_ROUND_TRIP_FEE_PCT", "3") / 100
@@ -133,6 +146,7 @@ class Sniper:
         self.hist = deque(maxlen=SCALE_WINDOW)
         self.since_switch = 0.0
         self.kp = None
+        self.tip_accounts = []
         if not PAPER:
             if not (RPC_URL and PRIVATE_KEY):
                 raise SystemExit("LIVE mode needs RPC_URL and PRIVATE_KEY in .env")
@@ -152,6 +166,8 @@ class Sniper:
                  "on" if AUTO_SCALE else "off")
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
             self.http = http
+            if not PAPER:
+                await self.preflight()
             self._ticker = asyncio.create_task(self.ticker())
             while True:
                 try:
@@ -160,6 +176,23 @@ class Sniper:
                     log.warning("Stream dropped (%s), reconnecting", e)
                 self.ws = None
                 await asyncio.sleep(2)
+
+    async def preflight(self):
+        bal = await self.rpc("getBalance", [str(self.kp.pubkey())])
+        sol = ((bal or {}).get("value") or 0) / 1e9
+        need = max(p.buy_sol * p.max_positions for p in PROFILES.values()) + 0.05
+        log.info("Wallet balance: %.4f SOL", sol)
+        if sol < self.cfg.buy_sol + 0.01:
+            raise SystemExit(f"Balance {sol:.4f} SOL is too low to trade. Fund the wallet first.")
+        if sol < need:
+            log.warning("Balance is below the %.2f SOL needed for max positions; the bot will run but may skip buys.", need)
+        if JITO:
+            try:
+                res = await self.jito("/api/v1/getTipAccounts", "getTipAccounts", [])
+                self.tip_accounts = res or JITO_TIP_FALLBACK
+            except Exception:
+                self.tip_accounts = JITO_TIP_FALLBACK
+            log.info("Jito bundles on via %s (%d tip accounts)", JITO_URL, len(self.tip_accounts))
 
     async def stream(self):
         async with websockets.connect(WS_URL, ping_interval=20, max_size=2**20) as ws:
@@ -320,6 +353,7 @@ class Sniper:
                     await self.sub(w.mint, False)
                     self.last.pop(w.mint, None)
                     return
+                log.info("Buy landed: https://solscan.io/tx/%s", sig)
             entry = self.last.get(w.mint, w.start_mcap)
             self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, time.time(), peak=entry)
             log.info("BUY [%s] %s at mcap %.1f SOL (%.3f SOL)", prof, w.symbol, entry, c.buy_sol)
@@ -330,11 +364,12 @@ class Sniper:
         c = PROFILES[p.profile]
         if not PAPER:
             amount = "100%" if frac >= 1 else f"{round(frac * 100)}%"
-            sig = await self.trade("sell", p.mint, amount, False, c)
+            sig = await self.trade("sell", p.mint, amount, False, c, SELL_URGENCY)
             if not sig or not await self.confirmed(sig):
                 log.error("SELL FAILED %s, will retry", p.symbol)
                 p.busy = False
                 return
+            log.info("Sell landed: https://solscan.io/tx/%s", sig)
         cur = self.last.get(p.mint, p.entry_mcap)
         r = cur / p.entry_mcap - 1
         sold = p.remaining * min(frac, 1.0)
@@ -361,7 +396,7 @@ class Sniper:
         await self.sub(p.mint, False)
         self.rescale()
 
-    async def trade(self, action, mint, amount, in_sol, c):
+    async def trade(self, action, mint, amount, in_sol, c, urgency=1.0):
         body = {
             "publicKey": str(self.kp.pubkey()),
             "action": action,
@@ -369,7 +404,7 @@ class Sniper:
             "amount": amount,
             "denominatedInSol": "true" if in_sol else "false",
             "slippage": c.slippage,
-            "priorityFee": c.priority_fee,
+            "priorityFee": round(c.priority_fee * urgency, 6),
             "pool": "auto",
         }
         try:
@@ -381,12 +416,42 @@ class Sniper:
             from solders.transaction import VersionedTransaction
             tx = VersionedTransaction.from_bytes(raw)
             signed = VersionedTransaction(tx.message, [self.kp])
-            encoded = base64.b64encode(bytes(signed)).decode()
-            return await self.rpc("sendTransaction",
-                                  [encoded, {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}])
+            sig = str(signed.signatures[0])
+            enc = base64.b64encode(bytes(signed)).decode()
+            # Race the same signed tx through the RPC and a Jito bundle; whichever lands first wins.
+            sends = [self.rpc("sendTransaction", [enc, {"encoding": "base64", "skipPreflight": True, "maxRetries": 3}])]
+            if JITO and self.tip_accounts:
+                tip = self.tip_tx(signed.message.recent_blockhash, JITO_TIP * urgency)
+                tip_enc = base64.b64encode(bytes(tip)).decode()
+                sends.append(self.jito("/api/v1/bundles", "sendBundle", [[enc, tip_enc], {"encoding": "base64"}]))
+            results = await asyncio.gather(*sends, return_exceptions=True)
+            if all(r is None or isinstance(r, Exception) for r in results):
+                log.warning("%s: every send path failed %s", action, results)
+                return None
+            return sig
         except Exception as e:
             log.warning("%s error: %s", action, e)
             return None
+
+    def tip_tx(self, blockhash, tip_sol):
+        from solders.message import MessageV0
+        from solders.pubkey import Pubkey
+        from solders.system_program import TransferParams, transfer
+        from solders.transaction import VersionedTransaction
+        ix = transfer(TransferParams(from_pubkey=self.kp.pubkey(),
+                                     to_pubkey=Pubkey.from_string(random.choice(self.tip_accounts)),
+                                     lamports=int(tip_sol * 1e9)))
+        msg = MessageV0.try_compile(self.kp.pubkey(), [ix], [], blockhash)
+        return VersionedTransaction(msg, [self.kp])
+
+    async def jito(self, path, method, params):
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        async with self.http.post(JITO_URL + path, json=payload) as r:
+            data = await r.json(content_type=None)
+        if "error" in data:
+            log.debug("Jito %s error: %s", method, data["error"])
+            return None
+        return data.get("result")
 
     async def rpc(self, method, params):
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
@@ -411,7 +476,7 @@ class Sniper:
                         return True
             except Exception:
                 pass
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.4)
         return False
 
     async def has_socials(self, uri):
