@@ -46,7 +46,7 @@ PROFILES = {
         tp1=0.40, tp1_sell=0.50,        # at +40%, sell half
         trail=0.20,                     # then trail the rest 20% below its peak
         stop_loss=0.20, max_hold=150, max_positions=3,
-        max_dev_pct=8, min_buyers=6, min_growth=0.10, require_socials=True,
+        max_dev_pct=8, min_buyers=6, min_growth=0.10, require_socials=_b("MEDIUM_REQUIRE_SOCIALS", "true"),
     ),
     "high": SimpleNamespace(
         buy_sol=_f("HIGH_BUY_SOL", "0.10"),
@@ -55,7 +55,7 @@ PROFILES = {
         tp1=1.00, tp1_sell=0.30,        # at +100%, sell 30%
         trail=0.30,                     # let the rest run with a 30% trailing stop
         stop_loss=0.35, max_hold=300, max_positions=5,
-        max_dev_pct=15, min_buyers=3, min_growth=0.05, require_socials=False,
+        max_dev_pct=15, min_buyers=3, min_growth=0.05, require_socials=_b("HIGH_REQUIRE_SOCIALS", "false"),
     ),
 }
 
@@ -82,6 +82,8 @@ JITO_TIP_FALLBACK = [
     "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh", "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 ]
+
+IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/"]
 
 MAX_WATCH = _i("MAX_WATCH", "25")
 FEE_PCT = _f("EST_ROUND_TRIP_FEE_PCT", "3") / 100
@@ -139,6 +141,8 @@ class Sniper:
         self.pos: dict[str, Position] = {}
         self.last: dict[str, float] = {}
         self.pending = 0
+        self.stats = {"new": 0, "trades": 0, "buys": 0}
+        self.last_beat = time.time()
         self.ws = None
         self.http = None
         self.day, self.day_pnl, self.halt_logged = date.today(), 0.0, False
@@ -209,8 +213,10 @@ class Sniper:
                     continue
                 t = msg.get("txType")
                 if t == "create":
+                    self.stats["new"] += 1
                     await self.on_create(msg)
                 elif t in ("buy", "sell"):
+                    self.stats["trades"] += 1
                     await self.on_trade(msg)
 
     async def sub(self, mint, on=True):
@@ -239,9 +245,11 @@ class Sniper:
         asyncio.create_task(self.vet(w, m.get("uri")))
 
     async def vet(self, w, uri):
-        if self.cfg.require_socials and not await self.has_socials(uri):
-            await self.drop(w.mint, "no socials")
-            return
+        if self.cfg.require_socials:
+            ok, why = await self.has_socials(uri)
+            if not ok:
+                await self.drop(w.mint, f"no socials ({why})")
+                return
         w.vetted = True
         if self.cfg.window <= 0 and w.mint in self.watch and self.can_open():
             del self.watch[w.mint]
@@ -271,6 +279,12 @@ class Sniper:
         while True:
             await asyncio.sleep(1)
             c, now = self.cfg, time.time()
+            if now - self.last_beat >= 60:
+                log.info("STATUS [%s] last 60s: %d new tokens, %d trades seen, %d buys | watching %d, open %d, today %+.4f SOL",
+                         self.profile, self.stats["new"], self.stats["trades"], self.stats["buys"],
+                         len(self.watch), len(self.pos), self.day_pnl)
+                self.stats = {k: 0 for k in self.stats}
+                self.last_beat = now
             for w in list(self.watch.values()):
                 if w.dev_sold:
                     await self.drop(w.mint, "dev sold")
@@ -355,6 +369,7 @@ class Sniper:
                     return
                 log.info("Buy landed: https://solscan.io/tx/%s", sig)
             entry = self.last.get(w.mint, w.start_mcap)
+            self.stats["buys"] += 1
             self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, time.time(), peak=entry)
             log.info("BUY [%s] %s at mcap %.1f SOL (%.3f SOL)", prof, w.symbol, entry, c.buy_sol)
         finally:
@@ -480,12 +495,28 @@ class Sniper:
         return False
 
     async def has_socials(self, uri):
-        try:
-            async with self.http.get(uri, timeout=aiohttp.ClientTimeout(total=3)) as r:
-                meta = await r.json(content_type=None)
-            return any(meta.get(k) for k in ("twitter", "telegram", "website"))
-        except Exception:
-            return False
+        """Returns (ok, reason). Tries several IPFS gateways because public ones rate-limit."""
+        if not uri:
+            return False, "no metadata link"
+        cid = uri[7:] if uri.startswith("ipfs://") else uri.split("/ipfs/", 1)[1] if "/ipfs/" in uri else None
+        urls = [] if uri.startswith("ipfs://") else [uri]
+        if cid:
+            urls += [g + cid for g in IPFS_GATEWAYS if g + cid != uri]
+        last = "unknown"
+        for u in urls:
+            host = u.split("/")[2]
+            try:
+                async with self.http.get(u, timeout=aiohttp.ClientTimeout(total=2)) as r:
+                    if r.status != 200:
+                        last = f"HTTP {r.status} from {host}"
+                        continue
+                    meta = await r.json(content_type=None)
+                if any(meta.get(k) for k in ("twitter", "telegram", "website")):
+                    return True, ""
+                return False, "none listed"
+            except Exception as e:
+                last = f"{type(e).__name__} from {host}"
+        return False, f"metadata fetch failed: {last}"
 
     # ---------- history ----------
     def load_history(self):
