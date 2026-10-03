@@ -45,7 +45,8 @@ PROFILES = {
         slippage=25, priority_fee=0.0005, window=_f("MEDIUM_WINDOW_SEC", "8"),
         tp1=0.40, tp1_sell=0.50,        # at +40%, sell half
         trail=0.20,                     # then trail the rest 20% below its peak
-        stop_loss=0.20, max_hold=150, max_positions=3,
+        stop_loss=0.20, hard_stop=_f("MEDIUM_HARD_STOP_PCT", "35") / 100, max_hold=150, max_positions=3,
+        max_growth=_f("MEDIUM_MAX_GROWTH_PCT", "100") / 100,   # skip if price more than doubled while watching
         max_dev_pct=8, min_buyers=6, min_growth=0.10, require_socials=_b("MEDIUM_REQUIRE_SOCIALS", "true"),
     ),
     "high": SimpleNamespace(
@@ -54,7 +55,8 @@ PROFILES = {
         slippage=35, priority_fee=0.001, window=_f("HIGH_WINDOW_SEC", "4"),
         tp1=1.00, tp1_sell=0.30,        # at +100%, sell 30%
         trail=0.30,                     # let the rest run with a 30% trailing stop
-        stop_loss=0.35, max_hold=300, max_positions=5,
+        stop_loss=0.35, hard_stop=_f("HIGH_HARD_STOP_PCT", "50") / 100, max_hold=300, max_positions=5,
+        max_growth=_f("HIGH_MAX_GROWTH_PCT", "200") / 100,
         max_dev_pct=15, min_buyers=3, min_growth=0.05, require_socials=_b("HIGH_REQUIRE_SOCIALS", "false"),
     ),
 }
@@ -84,6 +86,8 @@ JITO_TIP_FALLBACK = [
 ]
 
 IPFS_GATEWAYS = ["https://ipfs.io/ipfs/", "https://dweb.link/ipfs/", "https://gateway.pinata.cloud/ipfs/"]
+
+STOP_CONFIRM_SEC = _f("STOP_CONFIRM_SEC", "1")   # price must stay below the stop this long
 
 MAX_WATCH = _i("MAX_WATCH", "25")
 FEE_PCT = _f("EST_ROUND_TRIP_FEE_PCT", "3") / 100
@@ -140,6 +144,7 @@ class Position:
     entry_slip: float = 0.0     # price move between buy decision and landing
     sell_sec: float = 0.0
     exit_slip: float = 0.0
+    below_since: float = 0.0    # when price first dropped below the stop loss
 
 
 class Sniper:
@@ -293,7 +298,7 @@ class Sniper:
 
     async def ticker(self):
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
             c, now = self.cfg, time.time()
             if now - self.last_beat >= 60:
                 bs, ss = self.stats["buy_secs"], self.stats["sell_secs"]
@@ -314,7 +319,9 @@ class Sniper:
                     continue
                 mcap = self.last.get(w.mint, w.start_mcap)
                 growth = mcap / w.start_mcap - 1 if w.start_mcap else 0
-                if len(w.buyers) >= c.min_buyers and growth >= c.min_growth and self.can_open():
+                if growth > c.max_growth:
+                    await self.drop(w.mint, f"skip: ran up too fast ({growth:+.0%})")
+                elif len(w.buyers) >= c.min_buyers and growth >= c.min_growth and self.can_open():
                     del self.watch[w.mint]
                     asyncio.create_task(self.buy(w))
                 else:
@@ -341,10 +348,18 @@ class Sniper:
         p.peak = max(p.peak, cur)
         r = cur / p.entry_mcap - 1
         frac, reason = None, None
+        now = time.time()
+        if r > -c.stop_loss:
+            p.below_since = 0.0             # price recovered, cancel any pending stop
         if not p.tp1_done and r >= c.tp1:
             frac, reason = c.tp1_sell, f"take profit 1 ({c.tp1_sell:.0%})"
+        elif r <= -c.hard_stop:
+            frac, reason = 1.0, "hard stop"  # real crash: sell immediately
         elif r <= -c.stop_loss:
-            frac, reason = 1.0, "stop loss"
+            if not p.below_since:
+                p.below_since = now
+            elif now - p.below_since >= STOP_CONFIRM_SEC:
+                frac, reason = 1.0, "stop loss"
         elif p.tp1_done and cur <= p.peak * (1 - c.trail):
             frac, reason = 1.0, "trailing stop"
         elif time.time() - p.opened >= c.max_hold:
