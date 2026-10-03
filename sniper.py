@@ -20,7 +20,7 @@ import os
 import random
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,6 +97,7 @@ WS_URL = "wss://pumpportal.fun/api/data" + (f"?api-key={PUMPPORTAL_API_KEY}" if 
 TRADE_URL = "https://pumpportal.fun/api/trade-local"
 SUPPLY = 1_000_000_000
 TRADES_CSV = Path("trades.csv")
+STATE_FILE = Path("state.json")   # open positions + daily PnL, so restarts are safe
 CSV_HEADER = ["closed_utc", "mode", "profile", "symbol", "mint", "size_sol", "entry_mcap_sol",
               "exit_mcap_sol", "return_pct", "est_pnl_sol", "held_sec", "reason",
               "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct"]
@@ -172,6 +173,7 @@ class Sniper:
             self.kp = Keypair.from_base58_string(PRIVATE_KEY)
         self.load_history()
         self.rescale()
+        self.load_state()
 
     @property
     def cfg(self):
@@ -384,6 +386,7 @@ class Sniper:
     def switch(self, new, why):
         log.warning("PROFILE %s -> %s (%s)", self.profile.upper(), new.upper(), why)
         self.profile, self.since_switch = new, 0.0
+        self.save_state()
 
     async def drop(self, mint, why):
         if self.watch.pop(mint, None):
@@ -416,6 +419,7 @@ class Sniper:
             self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, now, peak=entry,
                                         launch_to_buy=now - w.created, buy_sec=now - t0, entry_slip=slip)
             log.info("BUY [%s] %s at mcap %.1f SOL (%.3f SOL)", prof, w.symbol, entry, c.buy_sol)
+            self.save_state()
             log.info("SPEED buy %s: build+send %.2fs, confirm %.2fs, total %.2fs | price moved %+.1f%% while buying | %.1fs after launch",
                      w.symbol, t_sent - t0, now - t_sent, now - t0, slip * 100, now - w.created)
         finally:
@@ -450,6 +454,7 @@ class Sniper:
         if frac < 1:
             p.tp1_done, p.busy = True, False
             log.info("PARTIAL %s %s at %+.0f%%, %.0f%% left riding", p.symbol, reason, r * 100, p.remaining * 100)
+            self.save_state()
             return
         await self.close(p, reason, cur)
 
@@ -466,6 +471,7 @@ class Sniper:
         self.last.pop(p.mint, None)
         await self.sub(p.mint, False)
         self.rescale()
+        self.save_state()
 
     async def trade(self, action, mint, amount, in_sol, c, urgency=1.0):
         body = {
@@ -573,6 +579,43 @@ class Sniper:
             except Exception as e:
                 last = f"{type(e).__name__} from {host}"
         return False, f"metadata fetch failed: {last}"
+
+    # ---------- restart safety ----------
+    def save_state(self):
+        state = {
+            "mode": "paper" if PAPER else "live",
+            "day": self.day.isoformat(), "day_pnl": self.day_pnl,
+            "profile": self.profile, "since_switch": self.since_switch,
+            "positions": [asdict(p) for p in self.pos.values()],
+        }
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state))
+        tmp.replace(STATE_FILE)
+
+    def load_state(self):
+        if not STATE_FILE.exists():
+            return
+        try:
+            st = json.loads(STATE_FILE.read_text())
+        except ValueError:
+            log.warning("state.json unreadable, starting fresh")
+            return
+        if st.get("mode") != ("paper" if PAPER else "live"):
+            return
+        if st.get("day") == date.today().isoformat():
+            self.day_pnl = float(st.get("day_pnl", 0.0))
+        if AUTO_SCALE and st.get("profile") in PROFILES:
+            self.profile = st["profile"]
+            self.since_switch = float(st.get("since_switch", 0.0))
+        for d in st.get("positions", []):
+            d["busy"] = False
+            p = Position(**d)
+            self.pos[p.mint] = p
+            self.last[p.mint] = p.entry_mcap
+        if self.pos:
+            log.warning("Restored %d open position(s) from before restart: %s",
+                        len(self.pos), ", ".join(p.symbol for p in self.pos.values()))
+        log.info("Restored today's PnL %+.4f SOL, profile %s", self.day_pnl, self.profile.upper())
 
     # ---------- history ----------
     def load_history(self):
