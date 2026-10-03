@@ -94,7 +94,8 @@ TRADE_URL = "https://pumpportal.fun/api/trade-local"
 SUPPLY = 1_000_000_000
 TRADES_CSV = Path("trades.csv")
 CSV_HEADER = ["closed_utc", "mode", "profile", "symbol", "mint", "size_sol", "entry_mcap_sol",
-              "exit_mcap_sol", "return_pct", "est_pnl_sol", "held_sec", "reason"]
+              "exit_mcap_sol", "return_pct", "est_pnl_sol", "held_sec", "reason",
+              "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct"]
 
 if START_PROFILE not in PROFILES:
     raise SystemExit(f"RISK_PROFILE must be one of {list(PROFILES)}")
@@ -134,6 +135,11 @@ class Position:
     txs: int = 1
     tp1_done: bool = False
     busy: bool = False
+    launch_to_buy: float = 0.0  # seconds from token launch to our buy landing
+    buy_sec: float = 0.0        # seconds from buy decision to confirmed on-chain
+    entry_slip: float = 0.0     # price move between buy decision and landing
+    sell_sec: float = 0.0
+    exit_slip: float = 0.0
 
 
 class Sniper:
@@ -142,7 +148,7 @@ class Sniper:
         self.pos: dict[str, Position] = {}
         self.last: dict[str, float] = {}
         self.pending = 0
-        self.stats = {"new": 0, "trades": 0, "buys": 0}
+        self.stats = {"new": 0, "trades": 0, "buys": 0, "buy_secs": [], "sell_secs": []}
         self.last_beat = time.time()
         self.other_logged = 0
         self.trade_logged = False
@@ -290,10 +296,15 @@ class Sniper:
             await asyncio.sleep(1)
             c, now = self.cfg, time.time()
             if now - self.last_beat >= 60:
-                log.info("STATUS [%s] last 60s: %d new tokens, %d trades seen, %d buys | watching %d, open %d, today %+.4f SOL",
+                bs, ss = self.stats["buy_secs"], self.stats["sell_secs"]
+                speed = ""
+                if bs or ss:
+                    speed = " | avg buy %s, avg sell %s" % (f"{sum(bs)/len(bs):.2f}s" if bs else "-",
+                                                         f"{sum(ss)/len(ss):.2f}s" if ss else "-")
+                log.info("STATUS [%s] last 60s: %d new tokens, %d trades seen, %d buys | watching %d, open %d, today %+.4f SOL%s",
                          self.profile, self.stats["new"], self.stats["trades"], self.stats["buys"],
-                         len(self.watch), len(self.pos), self.day_pnl)
-                self.stats = {k: 0 for k in self.stats}
+                         len(self.watch), len(self.pos), self.day_pnl, speed)
+                self.stats = {"new": 0, "trades": 0, "buys": 0, "buy_secs": [], "sell_secs": []}
                 self.last_beat = now
             for w in list(self.watch.values()):
                 if w.dev_sold:
@@ -370,32 +381,52 @@ class Sniper:
         c, prof = self.cfg, self.profile
         self.pending += 1
         try:
+            t0 = time.time()
+            decided = self.last.get(w.mint, w.start_mcap)
+            t_sent = t0
             if not PAPER:
                 sig = await self.trade("buy", w.mint, c.buy_sol, True, c)
+                t_sent = time.time()
                 if not sig or not await self.confirmed(sig):
-                    log.warning("Buy failed for %s", w.symbol)
+                    log.warning("Buy failed for %s after %.2fs", w.symbol, time.time() - t0)
                     await self.sub(w.mint, False)
                     self.last.pop(w.mint, None)
                     return
                 log.info("Buy landed: https://solscan.io/tx/%s", sig)
+            now = time.time()
             entry = self.last.get(w.mint, w.start_mcap)
+            slip = entry / decided - 1 if decided else 0.0
             self.stats["buys"] += 1
-            self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, time.time(), peak=entry)
+            self.stats["buy_secs"].append(now - t0)
+            self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, now, peak=entry,
+                                        launch_to_buy=now - w.created, buy_sec=now - t0, entry_slip=slip)
             log.info("BUY [%s] %s at mcap %.1f SOL (%.3f SOL)", prof, w.symbol, entry, c.buy_sol)
+            log.info("SPEED buy %s: build+send %.2fs, confirm %.2fs, total %.2fs | price moved %+.1f%% while buying | %.1fs after launch",
+                     w.symbol, t_sent - t0, now - t_sent, now - t0, slip * 100, now - w.created)
         finally:
             self.pending -= 1
 
     async def sell(self, p, frac, reason):
         c = PROFILES[p.profile]
+        t0 = time.time()
+        trigger = self.last.get(p.mint, p.entry_mcap)
+        t_sent = t0
         if not PAPER:
             amount = "100%" if frac >= 1 else f"{round(frac * 100)}%"
             sig = await self.trade("sell", p.mint, amount, False, c, SELL_URGENCY)
+            t_sent = time.time()
             if not sig or not await self.confirmed(sig):
-                log.error("SELL FAILED %s, will retry", p.symbol)
+                log.error("SELL FAILED %s after %.2fs, will retry", p.symbol, time.time() - t0)
                 p.busy = False
                 return
             log.info("Sell landed: https://solscan.io/tx/%s", sig)
         cur = self.last.get(p.mint, p.entry_mcap)
+        now = time.time()
+        p.sell_sec = now - t0
+        p.exit_slip = cur / trigger - 1 if trigger else 0.0
+        self.stats["sell_secs"].append(p.sell_sec)
+        log.info("SPEED sell %s (%s): build+send %.2fs, confirm %.2fs, total %.2fs | price moved %+.1f%% while selling",
+                 p.symbol, reason, t_sent - t0, now - t_sent, p.sell_sec, p.exit_slip * 100)
         r = cur / p.entry_mcap - 1
         sold = p.remaining * min(frac, 1.0)
         p.realized += sold * r
@@ -540,6 +571,7 @@ class Sniper:
                 TRADES_CSV.rename(old)
                 log.info("Old trades.csv moved to %s", old)
                 return
+            needs_header = rows.fieldnames != CSV_HEADER
             mode = "paper" if PAPER else "live"
             for row in rows:
                 if row.get("mode") == mode:
@@ -547,6 +579,11 @@ class Sniper:
                         self.hist.append(float(row["est_pnl_sol"]))
                     except (KeyError, ValueError):
                         pass
+        if needs_header:
+            lines = TRADES_CSV.read_text().splitlines()
+            lines[0] = ",".join(CSV_HEADER)
+            TRADES_CSV.write_text("\n".join(lines) + "\n")
+            log.info("trades.csv header updated with speed columns")
         if self.hist:
             log.info("Loaded last %d %s trades for auto-scaling", len(self.hist), "paper" if PAPER else "live")
 
@@ -559,7 +596,9 @@ class Sniper:
             wr.writerow([datetime.now(timezone.utc).isoformat(timespec="seconds"),
                          "paper" if PAPER else "live", p.profile, p.symbol, p.mint, p.size_sol,
                          f"{p.entry_mcap:.2f}", f"{exit_mcap:.2f}", f"{p.realized * 100:.1f}",
-                         f"{pnl:.5f}", int(time.time() - p.opened), reason])
+                         f"{pnl:.5f}", int(time.time() - p.opened), reason,
+                         f"{p.launch_to_buy:.1f}", f"{p.buy_sec:.2f}", f"{p.sell_sec:.2f}",
+                         f"{p.entry_slip * 100:.1f}", f"{p.exit_slip * 100:.1f}"])
 
 
 if __name__ == "__main__":
