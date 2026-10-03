@@ -1,0 +1,14 @@
+[Unit]
+Description=pump.fun sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sniper
+WorkingDirectory=/opt/pump-sniper
+ExecStart=/opt/pump-sniper/venv/bin/python sniper.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
