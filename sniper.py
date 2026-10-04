@@ -100,7 +100,7 @@ TRADES_CSV = Path("trades.csv")
 STATE_FILE = Path("state.json")   # open positions + daily PnL, so restarts are safe
 CSV_HEADER = ["closed_utc", "mode", "profile", "symbol", "mint", "size_sol", "entry_mcap_sol",
               "exit_mcap_sol", "return_pct", "est_pnl_sol", "held_sec", "reason",
-              "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct"]
+              "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct", "real_pnl_sol"]
 
 if START_PROFILE not in PROFILES:
     raise SystemExit(f"RISK_PROFILE must be one of {list(PROFILES)}")
@@ -146,6 +146,7 @@ class Position:
     sell_sec: float = 0.0
     exit_slip: float = 0.0
     below_since: float = 0.0    # when price first dropped below the stop loss
+    sigs: list = field(default_factory=list)  # on-chain buy/sell signatures
 
 
 class Sniper:
@@ -157,6 +158,7 @@ class Sniper:
         self.stats = {"new": 0, "trades": 0, "buys": 0, "buy_secs": [], "sell_secs": []}
         self.last_beat = time.time()
         self.other_logged = 0
+        self.dry_beats = 0
         self.trade_logged = False
         self.ws = None
         self.http = None
@@ -166,6 +168,7 @@ class Sniper:
         self.since_switch = 0.0
         self.kp = None
         self.tip_accounts = []
+        self.start_balance = None
         if not PAPER:
             if not (RPC_URL and PRIVATE_KEY):
                 raise SystemExit("LIVE mode needs RPC_URL and PRIVATE_KEY in .env")
@@ -202,6 +205,7 @@ class Sniper:
         sol = ((bal or {}).get("value") or 0) / 1e9
         need = max(p.buy_sol * p.max_positions for p in PROFILES.values()) + 0.05
         log.info("Wallet balance: %.4f SOL", sol)
+        self.start_balance = sol
         if sol < self.cfg.buy_sol + 0.01:
             raise SystemExit(f"Balance {sol:.4f} SOL is too low to trade. Fund the wallet first.")
         if sol < need:
@@ -237,6 +241,8 @@ class Sniper:
                         log.info("Trade feed working, first trade: %s", str(msg)[:200])
                         self.trade_logged = True
                     await self.on_trade(msg)
+                elif "api key" in str(msg).lower() or "error" in str(msg).lower():
+                    log.error("PumpPortal problem: %s", str(msg)[:300])   # always shown
                 elif self.other_logged < 15:
                     # Subscription replies and errors from PumpPortal, kept for troubleshooting
                     log.info("PumpPortal says: %s", str(msg)[:300])
@@ -308,9 +314,29 @@ class Sniper:
                 if bs or ss:
                     speed = " | avg buy %s, avg sell %s" % (f"{sum(bs)/len(bs):.2f}s" if bs else "-",
                                                          f"{sum(ss)/len(ss):.2f}s" if ss else "-")
-                log.info("STATUS [%s] last 60s: %d new tokens, %d trades seen, %d buys | watching %d, open %d, today %+.4f SOL%s",
+                wallet = ""
+                if not PAPER and self.start_balance is not None:
+                    try:
+                        bal = await self.rpc("getBalance", [str(self.kp.pubkey())])
+                        sol = ((bal or {}).get("value") or 0) / 1e9
+                        wallet = f" | wallet {sol:.4f} SOL ({sol - self.start_balance:+.4f} since start)"
+                    except Exception:
+                        pass
+                log.info("STATUS [%s] last 60s: %d new tokens, %d trades seen, %d buys | watching %d, open %d, today %+.4f SOL%s%s",
                          self.profile, self.stats["new"], self.stats["trades"], self.stats["buys"],
-                         len(self.watch), len(self.pos), self.day_pnl, speed)
+                         len(self.watch), len(self.pos), self.day_pnl, speed, wallet)
+                # Watchdog: new tokens arriving but no trade data means the trade feed broke
+                if self.stats["new"] > 0 and self.stats["trades"] == 0:
+                    self.dry_beats += 1
+                    log.warning("No trade data for %d min. Check the PumpPortal API key wallet has 0.02+ SOL.", self.dry_beats)
+                    if self.dry_beats % 3 == 0 and self.ws:
+                        log.warning("Reconnecting to PumpPortal to recover the trade feed")
+                        try:
+                            await self.ws.close()
+                        except Exception:
+                            pass
+                else:
+                    self.dry_beats = 0
                 self.stats = {"new": 0, "trades": 0, "buys": 0, "buy_secs": [], "sell_secs": []}
                 self.last_beat = now
             for w in list(self.watch.values()):
@@ -418,6 +444,8 @@ class Sniper:
             self.stats["buy_secs"].append(now - t0)
             self.pos[w.mint] = Position(w.mint, w.symbol, w.dev, prof, c.buy_sol, entry, now, peak=entry,
                                         launch_to_buy=now - w.created, buy_sec=now - t0, entry_slip=slip)
+            if not PAPER:
+                self.pos[w.mint].sigs.append(sig)
             log.info("BUY [%s] %s at mcap %.1f SOL (%.3f SOL)", prof, w.symbol, entry, c.buy_sol)
             self.save_state()
             log.info("SPEED buy %s: build+send %.2fs, confirm %.2fs, total %.2fs | price moved %+.1f%% while buying | %.1fs after launch",
@@ -439,6 +467,7 @@ class Sniper:
                 p.busy = False
                 return
             log.info("Sell landed: https://solscan.io/tx/%s", sig)
+            p.sigs.append(sig)
         cur = self.last.get(p.mint, p.entry_mcap)
         now = time.time()
         p.sell_sec = now - t0
@@ -460,18 +489,43 @@ class Sniper:
 
     async def close(self, p, reason, exit_mcap):
         c = PROFILES[p.profile]
-        pnl = p.size_sol * (p.realized - FEE_PCT) - p.txs * c.priority_fee
+        est = p.size_sol * (p.realized - FEE_PCT) - p.txs * c.priority_fee
+        real = await self.real_pnl(p.sigs) if p.sigs else None
+        pnl = real if real is not None else est   # risk limits and auto-scale use real PnL when available
         self.day_pnl += pnl
         self.since_switch += pnl
         self.hist.append(pnl)
-        log.info("CLOSE [%s] %s (%s) total %+.0f%%, est PnL %+.4f SOL, today %+.4f",
-                 p.profile, p.symbol, reason, p.realized * 100, pnl, self.day_pnl)
-        self.record(p, exit_mcap, pnl, reason)
+        log.info("CLOSE [%s] %s (%s) total %+.0f%%, est PnL %+.4f SOL, real PnL %s, today %+.4f",
+                 p.profile, p.symbol, reason, p.realized * 100, est,
+                 f"{real:+.4f} SOL" if real is not None else "n/a", self.day_pnl)
+        self.record(p, exit_mcap, est, reason, real)
         self.pos.pop(p.mint, None)
         self.last.pop(p.mint, None)
         await self.sub(p.mint, False)
         self.rescale()
         self.save_state()
+
+    async def real_pnl(self, sigs):
+        """Actual SOL change across this trade's buy and sell transactions, read from the chain."""
+        total = 0
+        for sig in sigs:
+            delta = None
+            for _ in range(6):
+                try:
+                    tx = await self.rpc("getTransaction", [sig, {"encoding": "json", "commitment": "confirmed",
+                                                                 "maxSupportedTransactionVersion": 0}])
+                    meta = (tx or {}).get("meta")
+                    if meta:
+                        delta = meta["postBalances"][0] - meta["preBalances"][0]
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+            if delta is None:
+                log.warning("Could not read tx %s for real PnL", sig[:12])
+                return None
+            total += delta
+        return total / 1e9
 
     async def trade(self, action, mint, amount, in_sol, c, urgency=1.0):
         body = {
@@ -645,7 +699,7 @@ class Sniper:
         if self.hist:
             log.info("Loaded last %d %s trades for auto-scaling", len(self.hist), "paper" if PAPER else "live")
 
-    def record(self, p, exit_mcap, pnl, reason):
+    def record(self, p, exit_mcap, pnl, reason, real=None):
         new = not TRADES_CSV.exists()
         with TRADES_CSV.open("a", newline="") as f:
             wr = csv.writer(f)
@@ -656,7 +710,8 @@ class Sniper:
                          f"{p.entry_mcap:.2f}", f"{exit_mcap:.2f}", f"{p.realized * 100:.1f}",
                          f"{pnl:.5f}", int(time.time() - p.opened), reason,
                          f"{p.launch_to_buy:.1f}", f"{p.buy_sec:.2f}", f"{p.sell_sec:.2f}",
-                         f"{p.entry_slip * 100:.1f}", f"{p.exit_slip * 100:.1f}"])
+                         f"{p.entry_slip * 100:.1f}", f"{p.exit_slip * 100:.1f}",
+                         f"{real:.5f}" if real is not None else ""])
 
 
 if __name__ == "__main__":
