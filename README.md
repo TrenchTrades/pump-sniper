@@ -58,6 +58,21 @@ Live startup shows: `LIVE wallet ...`, `Wallet balance: ...`, `Jito bundles on v
 
 With `AUTO_SCALE=true`, after 20 closed trades it moves to high when win rate is 50%+ and net profitable, and back to medium when win rate drops under 40%, net PnL turns negative, or high loses 0.3 SOL.
 
+## Copy-trading mode
+Set `STRATEGY=copy` and list wallets in `COPY_WALLETS` (comma-separated). Needs `PUMPPORTAL_API_KEY`.
+- Buys `COPY_BUY_SOL` when a tracked wallet buys at least `COPY_MIN_LEADER_SOL` on the pump.fun bonding curve
+- Sells everything when that wallet sells, with stop loss, hard stop, take profit and max hold as backups
+- Never buys the same token twice per run; set `COPY_MIN_WALLETS=2` to require two tracked wallets to agree
+- Daily loss cap `COPY_DAILY_LOSS_SOL` uses real on-chain PnL
+
+### Managing wallets with scout.py
+```bash
+cd /opt/pump-sniper && sudo venv/bin/python scout.py
+```
+1) Find top wallets through Birdeye, 2) check/add a wallet from GMGN or Cielo, 3) see how copying each wallet has gone, 4) remove wallets.
+Wallets live in `wallets.txt`; the bot reloads it every 30 seconds. Needs `BIRDEYE_API_KEY` in `.env` for options 1 and 2.
+Shortcuts: `scout.py list`, `scout.py add ADDRESS note`, `scout.py remove ADDRESS`.
+
 ## Speed settings (.env)
 - `JITO=true`: each trade is raced through the RPC and a Jito bundle
 - `JITO_TIP_SOL`: higher lands faster, costs more

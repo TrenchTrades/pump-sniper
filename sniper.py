@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -100,10 +101,47 @@ TRADES_CSV = Path("trades.csv")
 STATE_FILE = Path("state.json")   # open positions + daily PnL, so restarts are safe
 CSV_HEADER = ["closed_utc", "mode", "profile", "symbol", "mint", "size_sol", "entry_mcap_sol",
               "exit_mcap_sol", "return_pct", "est_pnl_sol", "held_sec", "reason",
-              "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct", "real_pnl_sol"]
+              "launch_to_buy_sec", "buy_sec", "sell_sec", "entry_slip_pct", "exit_slip_pct", "real_pnl_sol", "leader"]
 
-if START_PROFILE not in PROFILES:
-    raise SystemExit(f"RISK_PROFILE must be one of {list(PROFILES)}")
+# ---------- strategy: snipe new launches, or copy proven wallets ----------
+STRATEGY = os.getenv("STRATEGY", "snipe").strip().lower()
+COPY_WALLETS = [w.strip() for w in os.getenv("COPY_WALLETS", "").split(",") if w.strip()]
+WALLETS_FILE = Path("wallets.txt")   # managed with scout.py, reloaded every 30s
+B58 = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+
+
+def load_wallets():
+    """Wallets from .env COPY_WALLETS plus wallets.txt (one per line, notes after #)."""
+    out = [w for w in COPY_WALLETS if B58.match(w)]
+    if WALLETS_FILE.exists():
+        for line in WALLETS_FILE.read_text().splitlines():
+            addr = line.split("#", 1)[0].strip()
+            if B58.match(addr) and addr not in out:
+                out.append(addr)
+    return out
+COPY_MIN_LEADER_SOL = _f("COPY_MIN_LEADER_SOL", "0.2")     # ignore tiny test buys by the leader
+COPY_MAX_MCAP_SOL = _f("COPY_MAX_MCAP_SOL", "800")         # skip if token is already big (0 = off)
+COPY_MIN_WALLETS = _i("COPY_MIN_WALLETS", "1")             # how many tracked wallets must buy the same token
+COPY_WINDOW_SEC = _f("COPY_WINDOW_SEC", "300")             # ...within this many seconds
+COPY_EXIT_ON_LEADER_SELL = _b("COPY_EXIT_ON_LEADER_SELL", "true")
+COPY_PUMP_ONLY = _b("COPY_PUMP_ONLY", "true")              # only copy bonding-curve buys (price feed is reliable there)
+
+PROFILES["copy"] = SimpleNamespace(
+    buy_sol=_f("COPY_BUY_SOL", "0.03"),
+    daily_loss=_f("COPY_DAILY_LOSS_SOL", "0.1"),
+    slippage=_f("COPY_SLIPPAGE_PCT", "25"), priority_fee=_f("COPY_PRIORITY_FEE_SOL", "0.0003"),
+    tp1=_f("COPY_TP1_PCT", "100") / 100, tp1_sell=_f("COPY_TP1_SELL_PCT", "50") / 100,
+    trail=_f("COPY_TRAIL_PCT", "30") / 100,
+    stop_loss=_f("COPY_STOP_LOSS_PCT", "25") / 100, hard_stop=_f("COPY_HARD_STOP_PCT", "40") / 100,
+    max_hold=_f("COPY_MAX_HOLD_SEC", "1800"), max_positions=_i("COPY_MAX_POSITIONS", "3"),
+    # sniper-only filters, unused in copy mode
+    window=0, min_buyers=0, min_growth=0, max_growth=99, max_dev_pct=100, require_socials=False,
+)
+
+if STRATEGY not in ("snipe", "copy"):
+    raise SystemExit("STRATEGY must be snipe or copy")
+if START_PROFILE not in ("medium", "high"):
+    raise SystemExit("RISK_PROFILE must be medium or high")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -147,6 +185,7 @@ class Position:
     exit_slip: float = 0.0
     below_since: float = 0.0    # when price first dropped below the stop loss
     sigs: list = field(default_factory=list)  # on-chain buy/sell signatures
+    leaders: list = field(default_factory=list)  # copied wallets that bought this token
 
 
 class Sniper:
@@ -163,7 +202,12 @@ class Sniper:
         self.ws = None
         self.http = None
         self.day, self.day_pnl, self.halt_logged = date.today(), 0.0, False
-        self.profile = START_PROFILE
+        self.profile = "copy" if STRATEGY == "copy" else START_PROFILE
+        self.copyset = set(load_wallets()) if STRATEGY == "copy" else set()
+        self.last_wallet_check = time.time()
+        self.leader_buys: dict[str, dict] = {}
+        self.buying: set = set()
+        self.copied: set = set()
         self.hist = deque(maxlen=SCALE_WINDOW)
         self.since_switch = 0.0
         self.kp = None
@@ -186,7 +230,14 @@ class Sniper:
     async def run(self):
         who = "PAPER" if PAPER else f"LIVE wallet {self.kp.pubkey()}"
         log.info("Starting in %s mode, profile %s, auto-scale %s", who, self.profile.upper(),
-                 "on" if AUTO_SCALE else "off")
+                 "on" if AUTO_SCALE and STRATEGY == "snipe" else "off")
+        if STRATEGY == "copy":
+            if not PUMPPORTAL_API_KEY:
+                raise SystemExit("STRATEGY=copy needs PUMPPORTAL_API_KEY (wallet tracking requires it)")
+            if self.copyset:
+                log.info("COPY-TRADING %d wallet(s): %s", len(self.copyset), ", ".join(w[:6] + ".." for w in self.copyset))
+            else:
+                log.warning("No copy wallets yet. Add some with scout.py; the bot picks them up within 30s.")
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
             self.http = http
             if not PAPER:
@@ -221,7 +272,11 @@ class Sniper:
     async def stream(self):
         async with websockets.connect(WS_URL, ping_interval=20, max_size=2**20) as ws:
             self.ws = ws
-            await ws.send(json.dumps({"method": "subscribeNewToken"}))
+            if STRATEGY == "copy":
+                if self.copyset:
+                    await ws.send(json.dumps({"method": "subscribeAccountTrade", "keys": list(self.copyset)}))
+            else:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
             keys = list(self.watch) + list(self.pos)
             if keys:
                 await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": keys}))
@@ -240,6 +295,8 @@ class Sniper:
                     if not self.trade_logged:
                         log.info("Trade feed working, first trade: %s", str(msg)[:200])
                         self.trade_logged = True
+                    if STRATEGY == "copy" and msg.get("traderPublicKey") in self.copyset:
+                        await self.on_leader(msg)
                     await self.on_trade(msg)
                 elif "api key" in str(msg).lower() or "error" in str(msg).lower():
                     log.error("PumpPortal problem: %s", str(msg)[:300])   # always shown
@@ -298,16 +355,94 @@ class Sniper:
                 w.dev_sold = True
         p = self.pos.get(mint)
         if p:
-            if m["txType"] == "sell" and trader == p.dev and not p.busy:
+            is_copy = p.profile == "copy"
+            leader_sold = is_copy and COPY_EXIT_ON_LEADER_SELL and (trader == p.dev or trader in p.leaders)
+            dev_sold = not is_copy and trader == p.dev
+            if m["txType"] == "sell" and (leader_sold or dev_sold) and not p.busy:
                 p.busy = True
-                asyncio.create_task(self.sell(p, 1.0, "dev sold"))
+                asyncio.create_task(self.sell(p, 1.0, "leader sold" if is_copy else "dev sold"))
             else:
                 self.check_exit(p)
+
+    async def on_leader(self, m):
+        """A tracked wallet traded. Copy its buys that pass the filters."""
+        if m.get("txType") != "buy":
+            return
+        mint, trader = m.get("mint"), m.get("traderPublicKey", "")
+        sol = float(m.get("solAmount") or 0)
+        mcap = float(m.get("marketCapSol") or 0)
+        if not mint or mint in self.pos or mint in self.buying or mint in self.copied:
+            return
+        pool = m.get("pool")
+        if COPY_PUMP_ONLY and pool and pool != "pump":
+            log.info("Copy skip %s..: %s bought on %s, not the bonding curve", mint[:6], trader[:6], pool)
+            return
+        if sol < COPY_MIN_LEADER_SOL:
+            log.info("Copy skip %s..: %s bought only %.3f SOL", mint[:6], trader[:6], sol)
+            return
+        if not mcap:
+            log.info("Copy skip %s..: no price in trade data", mint[:6])
+            return
+        if COPY_MAX_MCAP_SOL and mcap > COPY_MAX_MCAP_SOL:
+            log.info("Copy skip %s..: mcap %.0f SOL above %.0f", mint[:6], mcap, COPY_MAX_MCAP_SOL)
+            return
+        now = time.time()
+        buys = self.leader_buys.setdefault(mint, {})
+        buys[trader] = now
+        for w, t in list(buys.items()):
+            if now - t > COPY_WINDOW_SEC:
+                del buys[w]
+        if len(buys) < COPY_MIN_WALLETS:
+            log.info("Copy signal %s..: %d/%d tracked wallets bought", mint[:6], len(buys), COPY_MIN_WALLETS)
+            return
+        if not self.can_open():
+            log.info("Copy skip %s..: max positions or daily loss cap", mint[:6])
+            return
+        self.buying.add(mint)
+        self.copied.add(mint)
+        self.last[mint] = mcap
+        await self.sub(mint)
+        log.info("COPY %s..: %s bought %.3f SOL at mcap %.1f SOL", mint[:6], trader[:6], sol, mcap)
+        w = Watch(mint, m.get("symbol") or mint[:6], trader, now, mcap)
+        asyncio.create_task(self.copy_buy(w, list(buys)))
+
+    async def reload_wallets(self):
+        try:
+            new = set(load_wallets())
+        except Exception as e:
+            log.warning("Could not read wallets.txt: %s", e)
+            return
+        added, removed = new - self.copyset, self.copyset - new
+        if not (added or removed):
+            return
+        self.copyset = new
+        if self.ws:
+            try:
+                if added:
+                    await self.ws.send(json.dumps({"method": "subscribeAccountTrade", "keys": list(added)}))
+                if removed:
+                    await self.ws.send(json.dumps({"method": "unsubscribeAccountTrade", "keys": list(removed)}))
+            except Exception as e:
+                log.warning("Wallet resubscribe failed: %s", e)
+        log.info("Copy wallets updated: +%d, -%d, now tracking %d", len(added), len(removed), len(new))
+
+    async def copy_buy(self, w, leaders):
+        try:
+            await self.buy(w)
+            p = self.pos.get(w.mint)
+            if p:
+                p.leaders = leaders
+                self.save_state()
+        finally:
+            self.buying.discard(w.mint)
 
     async def ticker(self):
         while True:
             await asyncio.sleep(0.25)
             c, now = self.cfg, time.time()
+            if STRATEGY == "copy" and now - self.last_wallet_check >= 30:
+                self.last_wallet_check = now
+                await self.reload_wallets()
             if now - self.last_beat >= 60:
                 bs, ss = self.stats["buy_secs"], self.stats["sell_secs"]
                 speed = ""
@@ -397,6 +532,8 @@ class Sniper:
             asyncio.create_task(self.sell(p, frac, reason))
 
     def rescale(self):
+        if STRATEGY == "copy":
+            return
         if not AUTO_SCALE or len(self.hist) < SCALE_MIN_TRADES:
             if AUTO_SCALE and self.profile == "high" and self.since_switch <= -SCALE_DOWN_DRAWDOWN:
                 self.switch("medium", f"high lost {self.since_switch:.3f} SOL since scaling up")
@@ -658,7 +795,7 @@ class Sniper:
             return
         if st.get("day") == date.today().isoformat():
             self.day_pnl = float(st.get("day_pnl", 0.0))
-        if AUTO_SCALE and st.get("profile") in PROFILES:
+        if AUTO_SCALE and STRATEGY == "snipe" and st.get("profile") in ("medium", "high"):
             self.profile = st["profile"]
             self.since_switch = float(st.get("since_switch", 0.0))
         for d in st.get("positions", []):
@@ -711,7 +848,8 @@ class Sniper:
                          f"{pnl:.5f}", int(time.time() - p.opened), reason,
                          f"{p.launch_to_buy:.1f}", f"{p.buy_sec:.2f}", f"{p.sell_sec:.2f}",
                          f"{p.entry_slip * 100:.1f}", f"{p.exit_slip * 100:.1f}",
-                         f"{real:.5f}" if real is not None else ""])
+                         f"{real:.5f}" if real is not None else "",
+                         p.dev if p.profile == "copy" else ""])
 
 
 if __name__ == "__main__":
