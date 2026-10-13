@@ -34,6 +34,8 @@ MIN_TRADES = int(os.getenv("SCOUT_MIN_TRADES", "30"))      # too few trades = lu
 MAX_TRADES = int(os.getenv("SCOUT_MAX_TRADES", "3000"))    # too many = bot/MEV you can't keep up with
 MIN_WINRATE = float(os.getenv("SCOUT_MIN_WINRATE", "40"))
 CHECK_TOP = int(os.getenv("SCOUT_CHECK_TOP", "25"))        # how many candidates to look up in detail
+DELAY = float(os.getenv("SCOUT_DELAY_SEC", "1.2"))         # pause between Birdeye calls (free plans are rate-limited)
+PAGES = int(os.getenv("SCOUT_PAGES", "3"))                 # pages of 100 top traders to scan
 
 
 # ---------- Birdeye ----------
@@ -42,11 +44,19 @@ def birdeye(path, **params):
         raise RuntimeError("Add BIRDEYE_API_KEY to .env first (get a key at bds.birdeye.so)")
     url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
     req = urllib.request.Request(url, headers={"X-API-KEY": KEY, "x-chain": "solana", "accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            data = json.load(r)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Birdeye HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}")
+    for attempt in range(5):
+        time.sleep(DELAY)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = json.load(r)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 4:
+                wait = 2 ** (attempt + 1)
+                print(f"  Birdeye rate limit, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"Birdeye HTTP {e.code}: {e.read().decode(errors='ignore')[:200]}")
     if data.get("success") is False:
         raise RuntimeError(f"Birdeye: {data.get('message')}")
     return data.get("data") or {}
@@ -170,10 +180,15 @@ def show_list():
 def find():
     window = ask("Time window: 1W, 30d or 90d", "30d")
     print(f"\n  Getting top Solana traders by profit ({window}) from Birdeye...")
-    items = birdeye("/trader/gainers-losers", type=window, sort_by="PnL", sort_type="desc", limit=100).get("items", [])
-    mine = read_list()
-    cands = [x for x in items if x.get("address") not in mine and (x.get("pnl") or 0) > 0
-             and MIN_TRADES <= (x.get("trade_count") or 0) <= MAX_TRADES]
+    items, cands, mine = [], [], read_list()
+    for page in range(PAGES):
+        batch = birdeye("/trader/gainers-losers", type=window, sort_by="PnL", sort_type="desc",
+                        offset=page * 100, limit=100).get("items", [])
+        items += batch
+        cands += [x for x in batch if x.get("address") not in mine and (x.get("pnl") or 0) > 0
+                  and MIN_TRADES <= (x.get("trade_count") or 0) <= MAX_TRADES]
+        if len(batch) < 100 or len(cands) >= CHECK_TOP:
+            break
     print(f"  {len(items)} traders returned, {len(cands)} pass the trade-count filter "
           f"({MIN_TRADES}-{MAX_TRADES} trades). Checking the top {min(CHECK_TOP, len(cands))} in detail...")
     rows = []
@@ -186,7 +201,6 @@ def find():
         if st["win_rate"] is not None and st["win_rate"] < MIN_WINRATE:
             continue
         rows.append((x, st))
-        time.sleep(0.3)
     if not rows:
         print("  Nothing passed the filters. Try another window, or lower SCOUT_MIN_WINRATE in .env.")
         return
